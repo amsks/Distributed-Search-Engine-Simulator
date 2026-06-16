@@ -6,6 +6,7 @@ from __future__ import annotations
 import itertools
 import typing
 from asyncio import Future
+from collections import deque
 from typing import Iterable, List, Optional
 
 import pandas
@@ -23,12 +24,18 @@ class Profiler(Actor):
                  save_path: Optional[str] = None,
                  agents: Optional[List[Agent]] = None,
                  *,
-                 save_mode: str = 'wt'):
+                 save_mode: str = 'wt',
+                 agent_history_cycles: int = 12):
         super().__init__(collection)
 
         self._history = []
         self.latest = []
         self._history_df = pandas.DataFrame()
+        # Bounded rolling window of the last K cycles' rows handed to agents.
+        # Bounds per-cycle cost to O(K) (was O(N) full-history rebuild → O(N^2)
+        # per episode) while still supporting a history-based in-sim agent that
+        # looks back several cycles. Default 12 matches the frame-stack depth.
+        self._cycle_window: deque = deque(maxlen=agent_history_cycles)
 
         self.agents = agents or []
 
@@ -73,9 +80,20 @@ class Profiler(Actor):
                 self.print(time, actor, key, value)
         self.flush()
 
+        # Record this cycle in the bounded rolling window (newest last).
+        self._cycle_window.append(list(self.latest))
+
         r = None
-        for agent in self.agents:
-            r = r or agent.act(self.history)
+        if self.agents:
+            # Hand agents the last K cycles' rows — O(K) per cycle, not the
+            # unbounded full-history rebuild (O(N) per cycle → O(N^2) per
+            # episode). The newest cycle is last, so latest-timestamp-only agents
+            # (Stdio/Spendy/Oblivious) read the same rows as before via iloc[-1].
+            rows = [row for cycle in self._cycle_window for row in cycle]
+            window_df = pandas.DataFrame.from_records(
+                rows, columns=['time', 'actor', 'key', 'value'])
+            for agent in self.agents:
+                r = r or agent.act(window_df)
         return r
 
     def print(self, time: float, actor: 'ProfilableActor', key: str, value: float):
